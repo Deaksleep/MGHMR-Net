@@ -135,16 +135,3 @@ requested. Exact floating-point agreement can still vary across operating
 systems, accelerators, PyTorch releases, and DINOv2 revisions. Archive the
 resolved environment (`python -m pip freeze`) and hardware/CUDA details with
 the final paper results.
-
-## Citation
-
-If you use this repository, cite the associated article and the archived
-software release. Update `CITATION.cff` with the final author list, article DOI,
-repository URL, and release version before making the GitHub repository public.
-
-## License and research-use notice
-
-The source code is released under the MIT License. The separately distributed
-biological dataset must carry its own data-use license; see `data/README.md`.
-This research code is provided for scientific reproducibility and is not
-validated for clinical decision-making.
