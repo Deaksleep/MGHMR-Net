@@ -1,0 +1,23 @@
+.DS_Store
+.vscode/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Locally downloaded data and generated experiment artifacts
+data/images/
+data/*.zip
+data/*.xlsx
+data/*.xls
+data/*.csv
+data/*.tif
+data/*.tiff
+outputs/
+*.pth
+*.pt
+*.ckpt
+wandb/
+runs/

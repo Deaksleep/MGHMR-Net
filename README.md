@@ -106,7 +106,8 @@ Each run writes to `outputs/` by default:
 - `run_config.json`: exact CLI configuration and core software versions;
 - `final_model_dinov2_hybrid_fold_*.pth`: per-fold EMA weights;
 - `hybrid_multitask_training_history.csv`: epoch-level losses and accuracy;
-- `hybrid_multitask_oof_results.csv`: sample-level OOF predictions and errors;
+- `hybrid_multitask_oof_results.csv`: sample-level OOF predictions, fold IDs,
+  calibrated predictions, and errors;
 - `oof_dinov2_hybrid_multitask_ensemble.pth`: model states, calibration models,
   fold indices, predictions, and summary metrics.
 
@@ -124,8 +125,12 @@ median relative error, and Pearson correlation. Classification metrics include
 accuracy, balanced accuracy, macro/weighted F1, and a confusion matrix.
 
 The script also reports linear and day-aware post-hoc calibration estimates.
-These are generated with an inner cross-validation operation over the raw OOF
-predictions. When writing the paper, distinguish these calibrated estimates
+Within each outer fold, calibrators are fitted only on that fold's training-cell
+predictions and are then applied to its held-out validation cells. Thus, a
+validation cell's target is never used to fit the calibrator that produces its
+reported calibrated OOF prediction. Separate calibrators fitted to all OOF
+pairs are stored only as deployment artifacts and are not used for the reported
+fold-held-out metrics. When writing the paper, distinguish calibrated estimates
 from the uncalibrated primary OOF metrics.
 
 ## Reproducibility notes

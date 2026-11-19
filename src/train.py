@@ -34,7 +34,7 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import LinearRegression
 
 
@@ -470,8 +470,10 @@ def main(args=None):
         )
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     oof_reg_preds, oof_targets = [], []
+    oof_calibrated_preds, oof_day_aware_calibrated_preds = [], []
     oof_day_true, oof_day_pred, oof_day_prob = [], [], []
     oof_fnames, oof_days = [], []
+    oof_folds = []
     fold_records = []
     training_history = []
     history_csv_path = os.path.join(output_dir, "hybrid_multitask_training_history.csv")
@@ -645,6 +647,47 @@ def main(args=None):
                 print(f"  --> Epoch {epochs} finished; saved final EMA weights for fold evaluation.")
 
         model.load_state_dict(torch.load(final_model_path, weights_only=True))
+
+        # Fit both calibrators using this outer fold's training cells only.
+        # Inference uses deterministic preprocessing and the same horizontal-
+        # flip test-time augmentation (TTA) used for held-out validation cells.
+        calibration_loader = DataLoader(
+            Subset(clone_dataset_view(dataset, is_train=False), train_idx),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+        train_cal_preds, train_cal_probs = [], []
+        model.eval()
+        with torch.no_grad():
+            for imgs, patch_masks, _, _, _, _ in calibration_loader:
+                imgs = imgs.to(device)
+                patch_masks = patch_masks.to(device)
+                batch_pred_z, batch_probs = [], []
+                for flip in (False, True):
+                    imgs_in = torch.flip(imgs, dims=[3]) if flip else imgs
+                    day_logits, pred_z, _ = model(imgs_in, patch_masks)
+                    batch_pred_z.append(pred_z)
+                    batch_probs.append(torch.softmax(day_logits, dim=1))
+
+                avg_pred_z = torch.stack(batch_pred_z).mean(dim=0)
+                avg_probs = torch.stack(batch_probs).mean(dim=0)
+                train_preds = torch.exp(avg_pred_z * std_t + mean_t)
+                train_cal_preds.extend(
+                    train_preds.clamp(1e-2, 1200.0).cpu().numpy()
+                )
+                train_cal_probs.extend(avg_probs.cpu().numpy())
+
+        train_cal_preds = np.asarray(train_cal_preds)
+        train_cal_probs = np.asarray(train_cal_probs)
+        bias_corrector = LinearRegression().fit(
+            train_cal_preds.reshape(-1, 1), targets[train_idx]
+        )
+        day_aware_corrector = LinearRegression().fit(
+            np.column_stack([train_cal_preds, train_cal_probs]),
+            targets[train_idx],
+        )
         fold_records.append(
             {
                 "fold": fold,
@@ -655,11 +698,12 @@ def main(args=None):
                 "day_mean_z": [float(value) for value in day_mean_z],
                 "train_indices": train_idx.tolist(),
                 "val_indices": val_idx.tolist(),
+                "bias_corrector": bias_corrector,
+                "day_aware_bias_corrector": day_aware_corrector,
             }
         )
 
         model.eval()
-        tta_preds = []
         with torch.no_grad():
             for imgs, patch_masks, y_day, modulus, fnames, days in val_loader:
                 imgs = imgs.to(device)
@@ -676,15 +720,30 @@ def main(args=None):
                 final_preds = torch.exp(avg_pred_z * std_t + mean_t).cpu().numpy().flatten()
                 final_preds = np.clip(final_preds, 1e-2, 1200.0)
                 pred_day = avg_probs.argmax(dim=1).cpu().numpy()
+                probs_np = avg_probs.cpu().numpy()
+                calibrated_preds = np.maximum(
+                    bias_corrector.predict(final_preds.reshape(-1, 1)),
+                    1e-2,
+                )
+                day_aware_calibrated_preds = np.maximum(
+                    day_aware_corrector.predict(
+                        np.column_stack([final_preds, probs_np])
+                    ),
+                    1e-2,
+                )
 
                 oof_reg_preds.extend(final_preds)
                 oof_targets.extend(modulus.numpy())
                 oof_day_true.extend(y_day.numpy())
                 oof_day_pred.extend(pred_day)
-                oof_day_prob.extend(avg_probs.cpu().numpy())
+                oof_day_prob.extend(probs_np)
+                oof_calibrated_preds.extend(calibrated_preds)
+                oof_day_aware_calibrated_preds.extend(
+                    day_aware_calibrated_preds
+                )
                 oof_fnames.extend(fnames)
                 oof_days.extend(days.numpy())
-                tta_preds.extend(final_preds)
+                oof_folds.extend([fold + 1] * len(fnames))
 
     targets_arr = np.array(oof_targets)
     preds_arr = np.array(oof_reg_preds)
@@ -692,26 +751,23 @@ def main(args=None):
     day_pred_arr = np.array(oof_day_pred)
     day_prob_arr = np.array(oof_day_prob)
 
-    bias_corrector = LinearRegression()
-    corrected_preds_arr = cross_val_predict(
-        bias_corrector,
-        preds_arr.reshape(-1, 1),
-        targets_arr,
-        cv=KFold(n_splits=args.folds, shuffle=True, random_state=args.seed),
+    corrected_preds_arr = np.asarray(oof_calibrated_preds)
+    day_aware_corrected_preds_arr = np.asarray(
+        oof_day_aware_calibrated_preds
     )
-    corrected_preds_arr = np.maximum(corrected_preds_arr, 1e-2)
+    if not (
+        len(corrected_preds_arr)
+        == len(targets_arr)
+        == len(day_aware_corrected_preds_arr)
+    ):
+        raise RuntimeError("OOF calibration output lengths are inconsistent.")
+
+    # These full-OOF calibrators are deployment artifacts only. Reported OOF
+    # metrics below use the fold-specific calibrators fitted above.
     final_bias_corrector = LinearRegression()
     final_bias_corrector.fit(preds_arr.reshape(-1, 1), targets_arr)
 
     day_cal_features = np.column_stack([preds_arr, day_prob_arr])
-    day_aware_corrector = LinearRegression()
-    day_aware_corrected_preds_arr = cross_val_predict(
-        day_aware_corrector,
-        day_cal_features,
-        targets_arr,
-        cv=KFold(n_splits=args.folds, shuffle=True, random_state=args.seed),
-    )
-    day_aware_corrected_preds_arr = np.maximum(day_aware_corrected_preds_arr, 1e-2)
     final_day_aware_corrector = LinearRegression()
     final_day_aware_corrector.fit(day_cal_features, targets_arr)
 
@@ -788,6 +844,7 @@ def main(args=None):
     df_results = pd.DataFrame(
         {
             "Filename": oof_fnames,
+            "Fold": oof_folds,
             "True_Day": oof_days,
             "True_Day_Group": true_day_groups,
             "Predicted_Day_Group": pred_day_groups,
@@ -828,6 +885,7 @@ def main(args=None):
         "oof_day_pred": day_pred_arr,
         "oof_day_prob": day_prob_arr,
         "oof_filenames": oof_fnames,
+        "oof_folds": oof_folds,
         "metrics": {
             "r2": float(r2),
             "mae": float(mae),
